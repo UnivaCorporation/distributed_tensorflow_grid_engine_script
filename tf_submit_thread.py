@@ -1,131 +1,171 @@
 #!/usr/bin/env python
 
 from __future__ import print_function
-import sys
-import os
-import commands
-import threading
+
 import Queue
+import os
+import subprocess
+import sys
+import threading
 import time
 
 
-# thread class to run a command - used to run worker jobs
 class Thread(threading.Thread):
+    """
+    Thread class to run a command - used to run worker jobs
+
+    """
     def __init__(self, cmd, queue):
         threading.Thread.__init__(self)
         self.cmd = cmd
         self.queue = queue
 
     def run(self):
-        # execute the command, queue the result
-        (status, output) = commands.getstatusoutput(self.cmd)
+        p = subprocess.Popen(self.cmd, shell=True, stdout=subprocess.PIPE)
+        output, status = p.communicate()
         self.queue.put((self.cmd, output, status))
 
 
-# --------------------------------------------------------
-# Verify if the wrapper script is able to run
-# --------------------------------------------------------
+class Command(object):
+    """
+    Command line class.
 
-# parsing UGE environment variables
-job_id = os.environ.get('JOB_ID')
-pe_hostfile = os.environ.get('PE_HOSTFILE')
-pe_slot = os.environ.get('NSLOTS')
-pe_hostname = os.environ.get('HOSTNAME')
+    """
+    def __init__(self, argv):
+        # verifying required arguments
+        if len(argv) < 3:
+            raise Exception(" Missing commands or parameters...")
 
-if str(job_id) == "NONE" or str(pe_hostfile) == "NONE" or \
-        str(pe_slot) == "NONE" or str(pe_slot) == "1" or \
-        str(pe_hostname) == "NONE":
-    print("tf_script needs to be run under UGE qsub/qrsh parallel"
-          "environment...")
-    sys.exit(2)
+        # parsing UGE environment variables
+        self.job_id = os.environ.get('JOB_ID', 'NONE')
+        self.pe_hostfile = os.environ.get('PE_HOSTFILE', 'NONE')
+        self.pe_slot = os.environ.get('NSLOTS', 'NONE')
+        self.pe_hostname = os.environ.get('HOSTNAME', 'NONE')
+        if str(self.job_id) == 'NONE' or str(self.pe_hostfile) == 'NONE' or \
+                str(self.pe_slot) == 'NONE' or str(self.pe_slot) == '1' or \
+                str(self.pe_hostname) == 'NONE':
+            raise Exception(
+                'tf_script needs to be run under UGE qsub/qrsh parallel '
+                'environment...')
 
-# verifying required arguments
-if len(sys.argv) < 3:
-    print(" Missing commands or parameters...")
-    sys.exit(2)
+        self.port = self._get_port(argv)
+	print (self.port)
 
-# parsing parameters to get port (-p) and tensorflow script
-if sys.argv[1] == u'-p':
-    try:
-        port = int(sys.argv[2])
-    except ValueError:
-        print("Port value is invalid...")
-        sys.exit(2)
-else:
-    print("tf_submit.py -p <port>")
-    print("Missing parameter...")
-    sys.exit(2)
+        self.tf_script = self._get_tf_script(argv)
 
-# Get the Tensorflow script and its parameters
-# The rest of argument assumes TF script & its parameters
-tf_script = " ".join(str(e) for e in sys.argv[3:])
+        self.worker_list = []
+        self._build_worker_list()
 
-# ------------------------------------------------------------
-# Constructing TF Cluster Topology list from UGE PE_HOSTFILE
-# ------------------------------------------------------------
+        self.master_host = self.worker_list.pop(0)
+	print (self.master_host)
 
-worker_list = []
-master_host = ""
+        # Keep the list of workers in string
+        self.worker_string = ",".join(str(x) for x in self.worker_list)
 
-# parsing PE_HOSTFILE to get list of master and slave nodes that are
-# allocated by UGE.
-try:
-    for lines in tuple(open(pe_hostfile)):
-        host = str(lines).split(" ")[0]
-        num = int(str(lines).split(" ")[1])
-        for i in range(num):
-            worker_list.append(host + ":" + str(port))
-            port += 1
-except Exception as e:
-    print(e)
+        self.cmds = []
 
-master_host = worker_list[0]        # First node will be used as master
-worker_list.pop(0)
+        self.result_queue = None
 
-# Keep the list of workers in string
-worker_str = ",".join(str(x) for x in worker_list)
+    def _get_port(self, argv):
+        """
+        Parse the port (-p) from argv
 
-print("Initial ps task...")
+        """
+        if argv[1] == u'-p':
+            try:
+                port = int(sys.argv[2])
+            except ValueError:
+                raise Exception("Port value must be an integer")
+        else:
+            raise Exception('Missing port parameter: -p <port>')
+        return port
 
-# Define qrsh -inherit ... command
-command = '$SGE_BINARY_PATH/qrsh -inherit ' + master_host.split(":")[0] + \
-    ' python ' + str(tf_script) + ' -s ' + master_host + ' -w ' + \
-    worker_str + ' --job_name="ps" --task_index=0 &'
+    def _get_tf_script(self, argv):
+        """
+        Parse the tensorflow script from argv
 
-os.system(command)        # Starting ps...
+        """
+        # The rest of argument assumes TF script & its parameters
+        return " ".join(str(e) for e in argv[3:])
 
-os.system('sleep 1')
+    def _build_worker_list(self):
+        """
+        Constructing TF Cluster Topology list from UGE PE_HOSTFILE
 
-print(command)
+        """
+        # parsing PE_HOSTFILE to get list of master and slave nodes that are
+        # allocated by UGE.
+        port = self.port
+        for lines in tuple(open(self.pe_hostfile)):
+            host = str(lines).split(" ")[0]
+            num = int(str(lines).split(" ")[1])
+            for i in range(num):
+                self.worker_list.append(host + ":" + str(port))
+                port += 1
 
-cmds = []
+    def run(self):
+        self._initialize_master()
+        self._build_worker_commands()
+        self._initialize_result_queue()
+        self._start_threads()
+        self.result_queue.join()
 
-print("Initial worker task...")
+        # print results as we get them
+        while threading.active_count() > 1 or not self.result_queue.empty():
+            while not self.result_queue.empty():
+                (cmd, output, status) = self.result_queue.get()
+                print("%s:" % cmd)
+                print(output)
+                print('=' * 60)
+            time.sleep(1)
 
-for i in range(int(pe_slot) - 1):
-    command = '$SGE_BINARY_PATH/qrsh -inherit ' + \
-        str(worker_list[i].split(":")[0]) + ' python '+str(tf_script) + \
-        ' -s '+master_host+' -w ' + worker_str + \
-        ' --job_name="worker" --task_index='+str(i)
-    cmds.append(command)
-    print(command)
+    def _initialize_master(self):
+        print("Initial ps task...")
+        # Define qrsh -inherit ... command
+        cmd = '$SGE_BINARY_PATH/qrsh -inherit {} python {} -s {} ' \
+              '-w {} --job_name="ps" --task_index=0 &'.format(
+                  self.master_host.split(":")[0],
+                  self.tf_script,
+                  self.master_host,
+                  self.worker_string
+              )
+        subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+        print(cmd)
 
-result_queue = Queue.Queue()
+    def _build_worker_commands(self):
+        """
+        Define the commands to be run in parallel
 
-print("------------------------------------------------------------")
+        """
+        print("Initial worker task...")
+        for i in range(int(self.pe_slot) - 1):
+            cmd = '$SGE_BINARY_PATH/qrsh -inherit {} python {} -s {} ' \
+                  '-w {} --job_name="worker" --task_index={}'.format(
+                      self.worker_list[i].split(":")[0],
+                      self.tf_script,
+                      self.master_host,
+                      self.worker_string,
+                      i
+                  )
+            self.cmds.append(cmd)
+            print(cmd)
 
-# define the commands to be run in parallel, run them
-for cmd in cmds:
-    thread = Thread(cmd, result_queue)
-    thread.start()
-    os.system('sleep 1')
+    def _initialize_result_queue(self):
+        """
+        Initialize the results queue.
 
-# print results as we get them
-while threading.active_count() > 1 or not result_queue.empty():
-    while not result_queue.empty():
-        (cmd, output, status) = result_queue.get()
-        print("%s:" % cmd)
-        print(output)
-        print('=' * 60)
+        """
+        self.result_queue = Queue.Queue()
 
-    time.sleep(1)
+    def _start_threads(self):
+        """
+        Run the commands as threads.
+
+        """
+        for cmd in self.cmds:
+            thread = Thread(cmd, self.result_queue)
+            thread.start()
+
+
+if __name__ == '__main__':
+    Command(sys.argv).run()
