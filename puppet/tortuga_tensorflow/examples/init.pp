@@ -9,4 +9,4 @@
 # Learn more about module testing here:
 # https://docs.puppet.com/guides/tests_smoke.html
 #
-include ::unicloud_tensorflow
+include ::tortuga_tensorflow
