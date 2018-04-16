@@ -7,6 +7,6 @@ TensorFlow workload on top of a Univa Grid Engine cluster.
 More details can be found at the following site that provides
 a comprehensive overview of the integration and instructions
 on how to install the integration in a Univa Grid Engine
-environment.
+environment:
 
-TBD
+https://blogs.univa.com/2018/04/integrating-distributed-tensorflow-with-grid-engine/
